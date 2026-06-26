@@ -81,7 +81,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 1. Initialization & Configuration
-    // We only need the API key if we are actually calling the AI
     let api_key = if !cli.only_file {
         Some(get_or_prompt_api_key(cli.silent)?)
     } else {
@@ -102,7 +101,6 @@ async fn main() -> Result<()> {
     }
 
     // 3. Output Management (Raw Log)
-    // If silent or only_file, we must write the raw log to gitlog.md
     if cli.only_file || cli.silent {
         fs::write("gitlog.md", &git_log).context("Failed to write gitlog.md")?;
         if !cli.silent {
@@ -115,11 +113,13 @@ async fn main() -> Result<()> {
     }
 
     // Resolve Language Name (Case-insensitive mapping)
+    // FIX: We use `_` to catch the fallback and return a reference to the original `cli.lang`
+    // which lives for the entire duration of the `main` function.
     let target_language = match cli.lang.to_uppercase().as_str() {
         "RU" => "Russian",
         "UA" => "Ukrainian",
         "EN" => "English",
-        other => other, // Fallback to whatever the user typed if it's not a standard abbreviation
+        _ => cli.lang.as_str(),
     };
 
     // 4. Gemini API Integration
@@ -130,7 +130,6 @@ async fn main() -> Result<()> {
     let summary = summarize_log(api_key.as_deref().unwrap(), &git_log, target_language).await?;
 
     // 5. Output Management (AI Result)
-    // Silent mode overrides output mode to effectively be "File"
     let final_output_mode = if cli.silent {
         OutputMode::File
     } else {
@@ -159,7 +158,6 @@ async fn main() -> Result<()> {
 
 /// Checks for GEMINI_API_KEY in env or .env file. Prompts the user if missing.
 fn get_or_prompt_api_key(silent: bool) -> Result<String> {
-    // Load .env if it exists, ignore errors if it doesn't
     let _ = dotenvy::dotenv();
 
     if let Ok(key) = env::var("GEMINI_API_KEY") {
@@ -183,7 +181,6 @@ fn get_or_prompt_api_key(silent: bool) -> Result<String> {
         anyhow::bail!("API key cannot be empty.");
     }
 
-    // Save to .env file
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -192,15 +189,15 @@ fn get_or_prompt_api_key(silent: bool) -> Result<String> {
 
     writeln!(file, "GEMINI_API_KEY={}", key).context("Failed to write to .env file")?;
 
-    // Set it for the current process
-    env::set_var("GEMINI_API_KEY", &key);
+    unsafe {
+        env::set_var("GEMINI_API_KEY", &key);
+    }
 
     Ok(key)
 }
 
 /// Executes the git log command and returns the stdout
 fn get_git_log(path: &str, period: &str) -> Result<String> {
-    // Verify the directory is a git repository
     let status = Command::new("git")
         .args(["-C", path, "rev-parse", "--is-inside-work-tree"])
         .output()
@@ -239,7 +236,6 @@ async fn summarize_log(api_key: &str, log_data: &str, language: &str) -> Result<
         api_key
     );
 
-    // Dynamically inject the requested language into the system prompt
     let system_prompt = format!(
         "You are an expert technical analyst. Read the provided git log. \
         Ignore routine or minor fixes. Group the changes by high-level business features \
