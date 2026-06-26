@@ -1,21 +1,26 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use directories::ProjectDirs;
+use inquire::{Select, Text};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
-/// CLI Arguments Definition
-#[derive(Parser, Debug)]
-#[command(author, version, about = "Summarize git logs for management using Gemini AI", long_about = None)]
+// ==========================================
+// CLI & Enums
+// ==========================================
+
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about = "Summarize git logs for management using AI", long_about = None)]
 struct Cli {
     /// Path to the git repository
     #[arg(long, default_value = ".")]
     path: String,
 
     /// Git log since period
-    #[arg(long, default_value = "2 years ago")]
+    #[arg(long, default_value = "2 weeks ago")]
     period: String,
 
     /// Only save the raw filtered git log to gitlog.md and exit
@@ -33,6 +38,10 @@ struct Cli {
     /// Output language for the summary (e.g., EN, RU, UA)
     #[arg(short, long, default_value = "EN")]
     lang: String,
+
+    /// Analysis depth mode
+    #[arg(short, long, value_enum, default_value_t = AnalysisMode::Medium)]
+    mode: AnalysisMode,
 }
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
@@ -42,56 +51,63 @@ enum OutputMode {
     Both,
 }
 
-// --- Gemini API Request/Response Structs ---
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiRequest {
-    system_instruction: SystemInstruction,
-    contents: Vec<Content>,
+#[derive(Clone, Debug, ValueEnum, PartialEq)]
+enum AnalysisMode {
+    Light,
+    Medium,
+    Deep,
 }
 
-#[derive(Serialize)]
-struct SystemInstruction {
-    parts: Vec<Part>,
+// ==========================================
+// Configuration Structs (TOML)
+// ==========================================
+
+#[derive(Serialize, Deserialize, Default)]
+struct AppConfig {
+    current_provider: String,
+    providers: Providers,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Providers {
+    gemini: Option<ProviderConfig>,
+    openai: Option<ProviderConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Content {
-    parts: Vec<Part>,
+struct ProviderConfig {
+    api_key: String,
+    model: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Part {
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct GeminiResponse {
-    candidates: Option<Vec<Candidate>>,
-}
-
-#[derive(Deserialize)]
-struct Candidate {
-    content: Content,
-}
+// ==========================================
+// Main Execution
+// ==========================================
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // 1. Determine if we should run the TUI (no args passed)
+    let args: Vec<String> = env::args().collect();
+    let run_tui = args.len() == 1;
 
-    // 1. Initialization & Configuration
-    let api_key = if !cli.only_file {
-        Some(get_or_prompt_api_key(cli.silent)?)
+    // 2. Load or Setup Configuration
+    let config = load_or_setup_config(run_tui)?;
+
+    // 3. Parse CLI or Run TUI to get parameters
+    let cli = if run_tui {
+        run_interactive_tui()?
     } else {
-        None
+        Cli::parse()
     };
 
-    // 2. Git Execution
+    // 4. Git Execution based on Mode
     if !cli.silent {
-        println!("Fetching git logs from '{}' since '{}'...", cli.path, cli.period);
+        println!(
+            "Fetching git logs from '{}' since '{}' (Mode: {:?})...",
+            cli.path, cli.period, cli.mode
+        );
     }
-    let git_log = get_git_log(&cli.path, &cli.period)?;
+    let git_log = get_git_log(&cli.path, &cli.period, &cli.mode)?;
 
     if git_log.trim().is_empty() {
         if !cli.silent {
@@ -100,7 +116,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 3. Output Management (Raw Log)
+    // 5. Output Management (Raw Log)
     if cli.only_file || cli.silent {
         fs::write("gitlog.md", &git_log).context("Failed to write gitlog.md")?;
         if !cli.silent {
@@ -112,9 +128,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve Language Name (Case-insensitive mapping)
-    // FIX: We use `_` to catch the fallback and return a reference to the original `cli.lang`
-    // which lives for the entire duration of the `main` function.
+    // Resolve Language Name
     let target_language = match cli.lang.to_uppercase().as_str() {
         "RU" => "Russian",
         "UA" => "Ukrainian",
@@ -122,14 +136,17 @@ async fn main() -> Result<()> {
         _ => cli.lang.as_str(),
     };
 
-    // 4. Gemini API Integration
+    // 6. AI Integration
     if !cli.silent {
-        println!("Sending logs to Gemini API for summarization (Language: {})...", target_language);
+        println!(
+            "Sending logs to {} for summarization (Language: {})...",
+            config.current_provider, target_language
+        );
     }
 
-    let summary = summarize_log(api_key.as_deref().unwrap(), &git_log, target_language).await?;
+    let summary = summarize_log(&config, &git_log, target_language, &cli.mode).await?;
 
-    // 5. Output Management (AI Result)
+    // 7. Output Management (AI Result)
     let final_output_mode = if cli.silent {
         OutputMode::File
     } else {
@@ -156,48 +173,120 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Checks for GEMINI_API_KEY in env or .env file. Prompts the user if missing.
-fn get_or_prompt_api_key(silent: bool) -> Result<String> {
-    let _ = dotenvy::dotenv();
+// ==========================================
+// Configuration & Setup Wizard
+// ==========================================
 
-    if let Ok(key) = env::var("GEMINI_API_KEY") {
-        if !key.trim().is_empty() {
-            return Ok(key);
+fn get_config_path() -> Result<PathBuf> {
+    let proj_dirs = ProjectDirs::from("", "", "git-analyzer")
+        .context("Could not determine home directory")?;
+    let config_dir = proj_dirs.config_dir();
+    if !config_dir.exists() {
+        fs::create_dir_all(config_dir)?;
+    }
+    Ok(config_dir.join("config.toml"))
+}
+
+fn load_or_setup_config(allow_interactive: bool) -> Result<AppConfig> {
+    let config_path = get_config_path()?;
+
+    if config_path.exists() {
+        let content = fs::read_to_string(&config_path)?;
+        if let Ok(config) = toml::from_str::<AppConfig>(&content) {
+            // Basic validation to ensure the current provider has a key
+            let has_key = match config.current_provider.as_str() {
+                "gemini" => config.providers.gemini.is_some(),
+                "openai" => config.providers.openai.is_some(),
+                _ => false,
+            };
+            if has_key {
+                return Ok(config);
+            }
         }
     }
 
-    if silent {
-        anyhow::bail!("GEMINI_API_KEY not found. Cannot prompt the user in --silent mode.");
+    if !allow_interactive {
+        anyhow::bail!("Configuration missing or invalid. Run the tool without arguments to trigger the setup wizard.");
     }
 
-    print!("GEMINI_API_KEY not found. Please enter your Gemini API Key: ");
-    io::stdout().flush()?;
+    // Setup Wizard
+    println!("Welcome! No valid configuration or API key found.");
+    let provider_choice = Select::new(
+        "Which provider do you want to configure first?",
+        vec!["gemini", "openai"],
+    )
+        .prompt()?;
 
-    let mut key = String::new();
-    io::stdin().read_line(&mut key).context("Failed to read from stdin")?;
-    let key = key.trim().to_string();
+    let api_key = Text::new(&format!("Enter your {} API Key:", provider_choice)).prompt()?;
 
-    if key.is_empty() {
-        anyhow::bail!("API key cannot be empty.");
+    let mut config = AppConfig {
+        current_provider: provider_choice.to_string(),
+        providers: Providers::default(),
+    };
+
+    if provider_choice == "gemini" {
+        config.providers.gemini = Some(ProviderConfig {
+            api_key,
+            model: "gemini-2.5-flash".to_string(),
+        });
+    } else {
+        config.providers.openai = Some(ProviderConfig {
+            api_key,
+            model: "gpt-4o-mini".to_string(),
+        });
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(".env")
-        .context("Failed to open or create .env file")?;
+    let toml_string = toml::to_string(&config)?;
+    fs::write(&config_path, toml_string)?;
+    println!("Configuration saved to {:?}\n", config_path);
 
-    writeln!(file, "GEMINI_API_KEY={}", key).context("Failed to write to .env file")?;
-
-    unsafe {
-        env::set_var("GEMINI_API_KEY", &key);
-    }
-
-    Ok(key)
+    Ok(config)
 }
 
-/// Executes the git log command and returns the stdout
-fn get_git_log(path: &str, period: &str) -> Result<String> {
+// ==========================================
+// Interactive TUI
+// ==========================================
+
+fn run_interactive_tui() -> Result<Cli> {
+    let period_opts = vec!["1 week ago", "2 weeks ago", "1 month ago", "Custom"];
+    let mut period = Select::new("Select time period:", period_opts).prompt()?.to_string();
+
+    if period == "Custom" {
+        period = Text::new("Enter custom period (e.g., '3 days ago'):").prompt()?;
+    }
+
+    let lang = Select::new("Select output language:", vec!["EN", "RU", "UA"]).prompt()?.to_string();
+
+    let mode_str = Select::new("Select analysis depth:", vec!["light", "medium", "deep"]).prompt()?;
+    let mode = match mode_str {
+        "light" => AnalysisMode::Light,
+        "deep" => AnalysisMode::Deep,
+        _ => AnalysisMode::Medium,
+    };
+
+    let output_str = Select::new("Select output target:", vec!["console", "file", "both"]).prompt()?;
+    let output = match output_str {
+        "file" => OutputMode::File,
+        "both" => OutputMode::Both,
+        _ => OutputMode::Console,
+    };
+
+    Ok(Cli {
+        path: ".".to_string(),
+        period,
+        only_file: false,
+        silent: false,
+        output,
+        lang,
+        mode,
+    })
+}
+
+// ==========================================
+// Git Execution
+// ==========================================
+
+fn get_git_log(path: &str, period: &str, mode: &AnalysisMode) -> Result<String> {
     let status = Command::new("git")
         .args(["-C", path, "rev-parse", "--is-inside-work-tree"])
         .output()
@@ -207,16 +296,42 @@ fn get_git_log(path: &str, period: &str) -> Result<String> {
         anyhow::bail!("The specified path '{}' is not a valid git repository.", path);
     }
 
+    let mut args = vec![
+        "-C".to_string(),
+        path.to_string(),
+        "log".to_string(),
+        format!("--since={}", period),
+        "--no-merges".to_string(),
+    ];
+
+    match mode {
+        AnalysisMode::Light => {
+            args.push("--oneline".to_string());
+        }
+        AnalysisMode::Medium => {
+            args.push("--name-status".to_string());
+            args.push("--pretty=format:COMMIT: %s (%ad)".to_string());
+            args.push("--date=short".to_string());
+        }
+        AnalysisMode::Deep => {
+            args.push("--name-status".to_string());
+            args.push("--pretty=format:COMMIT: %s (%ad)".to_string());
+            args.push("--date=short".to_string());
+            args.push("-p".to_string());
+            args.push("-U0".to_string()); // Zero context lines to save tokens
+            args.push("--".to_string());
+            args.push(".".to_string());
+            // Exclude heavy/useless files from the diff
+            args.push(":(exclude)*lock*".to_string());
+            args.push(":(exclude)*.lock".to_string());
+            args.push(":(exclude)vendor/".to_string());
+            args.push(":(exclude)node_modules/".to_string());
+            args.push(":(exclude)dist/".to_string());
+        }
+    }
+
     let output = Command::new("git")
-        .args([
-            "-C", path,
-            "log",
-            &format!("--since={}", period),
-            "--no-merges",
-            "--name-status",
-            "--pretty=format:COMMIT: %s (%ad)",
-            "--date=short"
-        ])
+        .args(&args)
         .output()
         .context("Failed to execute git log command")?;
 
@@ -228,51 +343,149 @@ fn get_git_log(path: &str, period: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Calls the Gemini 2.5 Flash API to summarize the git log in the requested language
-async fn summarize_log(api_key: &str, log_data: &str, language: &str) -> Result<String> {
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
-        api_key
-    );
+// ==========================================
+// AI Provider Integration
+// ==========================================
+
+async fn summarize_log(
+    config: &AppConfig,
+    log_data: &str,
+    language: &str,
+    mode: &AnalysisMode,
+) -> Result<String> {
+    let depth_instruction = match mode {
+        AnalysisMode::Light => "You are provided with a high-level list of commit messages.",
+        AnalysisMode::Medium => "You are provided with commit messages and the files modified.",
+        AnalysisMode::Deep => "You are provided with commit messages, modified files, and structural code diffs. Use the diffs to understand core logic changes (e.g., new API routes, database migrations).",
+    };
 
     let system_prompt = format!(
         "You are an expert technical analyst. Read the provided git log. \
+        {} \
         Ignore routine or minor fixes. Group the changes by high-level business features \
         or modules (e.g., 'Billing System Update', 'Refactoring'). \
         Highlight significant changes on the surface. Exclude any sales operations if visible. \
         The final summary must be non-technical, well-structured, and suited for management reporting. \
         You must generate the entire summary and report strictly in the {} language.",
-        language
+        depth_instruction, language
+    );
+
+    match config.current_provider.as_str() {
+        "gemini" => {
+            let provider_cfg = config.providers.gemini.as_ref().context("Gemini config missing")?;
+            call_gemini(&provider_cfg.api_key, &provider_cfg.model, &system_prompt, log_data).await
+        }
+        "openai" => {
+            let provider_cfg = config.providers.openai.as_ref().context("OpenAI config missing")?;
+            call_openai(&provider_cfg.api_key, &provider_cfg.model, &system_prompt, log_data).await
+        }
+        other => anyhow::bail!("Unsupported provider: {}", other),
+    }
+}
+
+// --- Gemini Implementation ---
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiRequest {
+    system_instruction: GeminiSystemInstruction,
+    contents: Vec<GeminiContent>,
+}
+#[derive(Serialize)]
+struct GeminiSystemInstruction { parts: Vec<GeminiPart> }
+#[derive(Serialize, Deserialize)]
+struct GeminiContent { parts: Vec<GeminiPart> }
+#[derive(Serialize, Deserialize)]
+struct GeminiPart { text: String }
+#[derive(Deserialize)]
+struct GeminiResponse { candidates: Option<Vec<GeminiCandidate>> }
+#[derive(Deserialize)]
+struct GeminiCandidate { content: GeminiContent }
+
+async fn call_gemini(api_key: &str, model: &str, system_prompt: &str, log_data: &str) -> Result<String> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
     );
 
     let req_body = GeminiRequest {
-        system_instruction: SystemInstruction {
-            parts: vec![Part { text: system_prompt }],
+        system_instruction: GeminiSystemInstruction {
+            parts: vec![GeminiPart { text: system_prompt.to_string() }],
         },
-        contents: vec![Content {
-            parts: vec![Part { text: log_data.to_string() }],
+        contents: vec![GeminiContent {
+            parts: vec![GeminiPart { text: log_data.to_string() }],
         }],
     };
 
-    let res = client.post(&url)
-        .header("Content-Type", "application/json")
-        .json(&req_body)
-        .send()
-        .await
-        .context("Failed to send request to Gemini API")?;
-
+    let res = client.post(&url).json(&req_body).send().await?;
     if !res.status().is_success() {
-        let err_text = res.text().await?;
-        anyhow::bail!("Gemini API returned an error: {}", err_text);
+        anyhow::bail!("Gemini API error: {}", res.text().await?);
     }
 
-    let response_data: GeminiResponse = res.json().await.context("Failed to parse Gemini API response")?;
-
+    let response_data: GeminiResponse = res.json().await?;
     let text = response_data.candidates
         .and_then(|mut c| c.pop())
         .and_then(|c| c.content.parts.into_iter().next())
         .map(|p| p.text)
+        .unwrap_or_else(|| "No summary generated.".to_string());
+
+    Ok(text)
+}
+
+// --- OpenAI Implementation ---
+
+#[derive(Serialize)]
+struct OpenAiRequest {
+    model: String,
+    messages: Vec<OpenAiMessage>,
+}
+#[derive(Serialize, Deserialize)]
+struct OpenAiMessage {
+    role: String,
+    content: String,
+}
+#[derive(Deserialize)]
+struct OpenAiResponse {
+    choices: Option<Vec<OpenAiChoice>>,
+}
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
+}
+
+async fn call_openai(api_key: &str, model: &str, system_prompt: &str, log_data: &str) -> Result<String> {
+    let client = reqwest::Client::new();
+    let url = "https://api.openai.com/v1/chat/completions";
+
+    let req_body = OpenAiRequest {
+        model: model.to_string(),
+        messages: vec![
+            OpenAiMessage {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            },
+            OpenAiMessage {
+                role: "user".to_string(),
+                content: log_data.to_string(),
+            },
+        ],
+    };
+
+    let res = client.post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&req_body)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        anyhow::bail!("OpenAI API error: {}", res.text().await?);
+    }
+
+    let response_data: OpenAiResponse = res.json().await?;
+    let text = response_data.choices
+        .and_then(|mut c| c.pop())
+        .map(|c| c.message.content)
         .unwrap_or_else(|| "No summary generated.".to_string());
 
     Ok(text)
